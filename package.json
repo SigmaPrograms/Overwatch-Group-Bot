@@ -5,7 +5,12 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "dev": "nodemon bot.js",
+    "setup": "node setup.js",
+    "diagnose": "node diagnose.js",
+    "view-db": "node view-database.js",
+    "migrate": "node migrate-db.js",
+    "status": "node status.js"
   },
   "keywords": [
     "discord",
