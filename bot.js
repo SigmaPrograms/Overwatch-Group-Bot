@@ -1,6 +1,7 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ComponentType, PermissionFlagsBits } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+require('dotenv').config();
 
 // Initialize Discord client
 const client = new Client({
@@ -14,14 +15,14 @@ const db = new sqlite3.Database(path.join(__dirname, 'overwatch_bot.db'));
 
 // Rank system configuration
 const RANKS = {
-    'Bronze': { divisions: [5, 4, 3, 2, 1], color: 0xCD7F32, wideGroupThreshold: 5 },
-    'Silver': { divisions: [5, 4, 3, 2, 1], color: 0xC0C0C0, wideGroupThreshold: 5 },
-    'Gold': { divisions: [5, 4, 3, 2, 1], color: 0xFFD700, wideGroupThreshold: 5 },
-    'Platinum': { divisions: [5, 4, 3, 2, 1], color: 0x00CED1, wideGroupThreshold: 5 },
-    'Diamond': { divisions: [5, 4, 3, 2, 1], color: 0xB57EDC, wideGroupThreshold: 5 },
-    'Master': { divisions: [5, 4, 3, 2, 1], color: 0xFF6B35, wideGroupThreshold: 3 },
-    'Grandmaster': { divisions: [5, 4, 3, 2, 1], color: 0xFF1744, wideGroupThreshold: 0 },
-    'Champion': { divisions: [1], color: 0xFFD700, wideGroupThreshold: 0 }
+    'Bronze': { divisions: [5, 4, 3, 2, 1], color: 0xCD7F32, wideGroupThreshold: 5, symbol: '🟫' },
+    'Silver': { divisions: [5, 4, 3, 2, 1], color: 0xC0C0C0, wideGroupThreshold: 5, symbol: '⚪' },
+    'Gold': { divisions: [5, 4, 3, 2, 1], color: 0xFFD700, wideGroupThreshold: 5, symbol: '🟨' },
+    'Platinum': { divisions: [5, 4, 3, 2, 1], color: 0x00CED1, wideGroupThreshold: 5, symbol: '🟦' },
+    'Diamond': { divisions: [5, 4, 3, 2, 1], color: 0xB57EDC, wideGroupThreshold: 5, symbol: '💎' },
+    'Master': { divisions: [5, 4, 3, 2, 1], color: 0xFF6B35, wideGroupThreshold: 3, symbol: '🟧' },
+    'Grandmaster': { divisions: [5, 4, 3, 2, 1], color: 0xFF1744, wideGroupThreshold: 0, symbol: '🔺' },
+    'Champion': { divisions: [1], color: 0xFFD700, wideGroupThreshold: 0, symbol: '👑' }
 };
 
 const GAME_MODES = {
@@ -85,13 +86,13 @@ function initializeDatabase() {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id INTEGER,
             user_id TEXT,
-            account_id INTEGER,
+            account_ids TEXT,
             preferred_roles TEXT,
             is_streaming BOOLEAN DEFAULT 0,
             queue_position INTEGER,
+            note TEXT,
             joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (session_id) REFERENCES sessions(id),
-            FOREIGN KEY (account_id) REFERENCES user_accounts(id)
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
         )`);
 
         // Session participants table
@@ -119,7 +120,17 @@ function getRankValue(rank, division) {
 }
 
 function formatRank(rank, division) {
-    return rank && division ? `${rank} ${division}` : 'Unranked';
+    if (!rank || !division) return 'Unranked';
+    const rankData = RANKS[rank];
+    return rankData ? `${rankData.symbol} ${rank} ${division}` : `${rank} ${division}`;
+}
+
+async function getUser(client, userId) {
+    try {
+        return await client.users.fetch(userId);
+    } catch (error) {
+        return null;
+    }
 }
 
 async function updateSessionMessage(sessionId) {
@@ -131,17 +142,23 @@ async function updateSessionMessage(sessionId) {
                 const channel = await client.channels.fetch(session.channel_id);
                 const message = await channel.messages.fetch(session.message_id);
 
-                // Get queue count
-                db.get(`SELECT COUNT(*) as count FROM session_queue WHERE session_id = ?`, [sessionId], async (err, result) => {
-                    const queueCount = result ? result.count : 0;
+                // Get queue with user details
+                db.all(`SELECT sq.*, GROUP_CONCAT(ua.account_name) as account_names 
+                        FROM session_queue sq 
+                        LEFT JOIN user_accounts ua ON ua.discord_id = sq.user_id AND ua.id IN (SELECT value FROM json_each(sq.account_ids))
+                        WHERE sq.session_id = ? 
+                        GROUP BY sq.id`, [sessionId], async (err, queue) => {
+                    
+                    const queueCount = queue ? queue.length : 0;
 
-                    // Get participants
-                    db.all(`SELECT sp.*, ua.account_name, ua.tank_rank, ua.tank_division, ua.dps_rank, ua.dps_division, ua.support_rank, ua.support_division 
+                    // Get participants with account details
+                    db.all(`SELECT sp.*, ua.account_name, ua.tank_rank, ua.tank_division, ua.dps_rank, ua.dps_division, ua.support_rank, ua.support_division, u.username
                             FROM session_participants sp 
                             LEFT JOIN user_accounts ua ON sp.account_id = ua.id 
+                            LEFT JOIN users u ON sp.user_id = u.discord_id
                             WHERE sp.session_id = ?`, [sessionId], async (err, participants) => {
                         
-                        const embed = await createSessionEmbed(session, queueCount, participants || []);
+                        const embed = await createSessionEmbed(session, queueCount, participants || [], queue || []);
                         const components = createSessionButtons(session, participants || []);
                         
                         await message.edit({ embeds: [embed], components: components });
@@ -155,14 +172,14 @@ async function updateSessionMessage(sessionId) {
     });
 }
 
-async function createSessionEmbed(session, queueCount = 0, participants = []) {
+async function createSessionEmbed(session, queueCount = 0, participants = [], queue = []) {
     const mode = GAME_MODES[session.game_mode];
     const scheduledTime = new Date(session.scheduled_time);
     
     const embed = new EmbedBuilder()
         .setTitle(`${mode.name} Session`)
         .setDescription(session.description || 'No description provided')
-        .setColor(session.status === 'open' ? 0x0099FF : session.status === 'full' ? 0xFF6B35 : 0xFF0000)
+        .setColor(session.status === 'open' ? 0x0099FF : session.status === 'full' ? 0xFF6B35 : session.status === 'closed' ? 0xFFD700 : 0xFF0000)
         .addFields(
             { name: 'Scheduled Time', value: `<t:${Math.floor(scheduledTime.getTime() / 1000)}:F>`, inline: true },
             { name: 'Status', value: session.status.charAt(0).toUpperCase() + session.status.slice(1), inline: true },
@@ -196,18 +213,44 @@ async function createSessionEmbed(session, queueCount = 0, participants = []) {
         embed.addFields({ name: 'Team Composition', value: teamComp, inline: false });
     }
 
-    // Add participant details
+    // Add participant details in a table-like format
     if (participants.length > 0) {
-        let participantList = '';
-        participants.forEach(p => {
-            const roleEmoji = ROLE_EMOJIS[p.role] || '🎮';
-            const streamEmoji = p.is_streaming ? '📺' : '';
+        let participantTable = '```\n';
+        participantTable += 'Player           | Role    | Rank      | Account\n';
+        participantTable += '-----------------|---------|-----------|----------------\n';
+        
+        for (const p of participants) {
+            const user = await getUser(client, p.user_id);
+            const username = user ? user.username : p.username || 'Unknown';
+            const roleEmoji = p.role === 'Tank' ? 'Tank' : p.role === 'DPS' ? 'DPS' : p.role === 'Support' ? 'Sup' : 'Any';
             const rank = p.role === 'Tank' ? formatRank(p.tank_rank, p.tank_division) :
                        p.role === 'DPS' ? formatRank(p.dps_rank, p.dps_division) :
                        p.role === 'Support' ? formatRank(p.support_rank, p.support_division) : 'Flex';
-            participantList += `${roleEmoji} ${p.account_name} (${rank}) ${streamEmoji}\n`;
-        });
-        embed.addFields({ name: 'Participants', value: participantList || 'None yet', inline: false });
+            
+            // Truncate long names to fit the table
+            const displayName = username.length > 15 ? username.substring(0, 12) + '...' : username.padEnd(15);
+            const displayRole = roleEmoji.padEnd(7);
+            const displayRank = rank.length > 10 ? rank.substring(0, 9) + '.' : rank.padEnd(10);
+            const displayAccount = p.account_name.length > 16 ? p.account_name.substring(0, 13) + '...' : p.account_name;
+            
+            participantTable += `${displayName} | ${displayRole} | ${displayRank} | ${displayAccount}${p.is_streaming ? ' 📺' : ''}\n`;
+        }
+        participantTable += '```';
+        
+        embed.addFields({ name: 'Current Players', value: participantTable, inline: false });
+    }
+
+    // Add queue notes if any
+    const queueWithNotes = queue.filter(q => q.note);
+    if (queueWithNotes.length > 0) {
+        let notesText = '';
+        for (const q of queueWithNotes) {
+            const user = await getUser(client, q.user_id);
+            notesText += `**${user ? user.username : 'Unknown'}**: ${q.note}\n`;
+        }
+        if (notesText) {
+            embed.addFields({ name: 'Queue Notes', value: notesText.substring(0, 1024), inline: false });
+        }
     }
 
     embed.setFooter({ text: `Session ID: ${session.id}` });
@@ -219,6 +262,7 @@ async function createSessionEmbed(session, queueCount = 0, participants = []) {
 function createSessionButtons(session, participants = []) {
     const mode = GAME_MODES[session.game_mode];
     const isFull = participants.length >= mode.total;
+    const isClosed = session.status === 'closed';
     
     const rows = [];
     
@@ -232,7 +276,7 @@ function createSessionButtons(session, participants = []) {
                     .setLabel(`Join as ${role}`)
                     .setEmoji(ROLE_EMOJIS[role])
                     .setStyle(ButtonStyle.Primary)
-                    .setDisabled(isFull)
+                    .setDisabled(isFull || isClosed)
             );
         }
         rows.push(roleRow);
@@ -245,7 +289,7 @@ function createSessionButtons(session, participants = []) {
                 .setCustomId(`join_queue_${session.id}`)
                 .setLabel('Join Queue')
                 .setStyle(ButtonStyle.Success)
-                .setDisabled(isFull),
+                .setDisabled(isFull || isClosed),
             new ButtonBuilder()
                 .setCustomId(`leave_queue_${session.id}`)
                 .setLabel('Leave Queue')
@@ -339,7 +383,11 @@ async function registerCommands() {
             .addIntegerOption(option =>
                 option.setName('session-id')
                     .setDescription('ID of the session to join')
-                    .setRequired(true)),
+                    .setRequired(true))
+            .addStringOption(option =>
+                option.setName('note')
+                    .setDescription('Optional note about your availability or preferences')
+                    .setRequired(false)),
         
         new SlashCommandBuilder()
             .setName('manage-session')
@@ -468,6 +516,21 @@ client.on('interactionCreate', async interaction => {
             case 'manage':
                 if (params[0] === 'team') {
                     await handleManageTeamButton(interaction, params[1]);
+                }
+                break;
+            case 'select':
+                if (params[0] === 'player') {
+                    await handleSelectPlayer(interaction, params.slice(1).join('_'));
+                }
+                break;
+            case 'close':
+                if (params[0] === 'session') {
+                    await handleCloseSession(interaction, params[1]);
+                }
+                break;
+            case 'edit':
+                if (params[0] === 'session') {
+                    await handleEditSession(interaction, params[1]);
                 }
                 break;
         }
@@ -615,6 +678,479 @@ async function handleAddAccount(interaction) {
     });
 }
 
+async function handleJoinQueue(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+
+    const sessionId = interaction.options.getInteger('session-id');
+    const note = interaction.options.getString('note');
+    const userId = interaction.user.id;
+
+    // Get session details
+    db.get(`SELECT * FROM sessions WHERE id = ?`, [sessionId], (err, session) => {
+        if (!session) {
+            interaction.editReply('Session not found.');
+            return;
+        }
+
+        if (session.status === 'closed') {
+            interaction.editReply('This session is closed for new players.');
+            return;
+        }
+
+        // Check if already in queue or team
+        db.get(`SELECT * FROM session_queue WHERE session_id = ? AND user_id = ?`,
+            [sessionId, userId], (err, inQueue) => {
+                if (inQueue) {
+                    interaction.editReply('You are already in the queue for this session!');
+                    return;
+                }
+
+                db.get(`SELECT * FROM session_participants WHERE session_id = ? AND user_id = ?`,
+                    [sessionId, userId], (err, inTeam) => {
+                        if (inTeam) {
+                            interaction.editReply('You are already in the team for this session!');
+                            return;
+                        }
+
+                        // Get user's accounts
+                        db.all(`SELECT * FROM user_accounts WHERE discord_id = ? ORDER BY is_primary DESC`,
+                            [userId], async (err, accounts) => {
+                                if (!accounts || accounts.length === 0) {
+                                    await interaction.editReply('You need to add an account first!');
+                                    return;
+                                }
+
+                                // Create account selection menu with checkboxes
+                                const accountSelect = new StringSelectMenuBuilder()
+                                    .setCustomId(`select_accounts_join_${sessionId}`)
+                                    .setPlaceholder('Select which accounts to use')
+                                    .setMinValues(1)
+                                    .setMaxValues(Math.min(accounts.length, 3))
+                                    .addOptions(accounts.map(acc => ({
+                                        label: acc.account_name,
+                                        value: acc.id.toString(),
+                                        description: `Tank: ${formatRank(acc.tank_rank, acc.tank_division)} | DPS: ${formatRank(acc.dps_rank, acc.dps_division)} | Support: ${formatRank(acc.support_rank, acc.support_division)}`,
+                                        default: acc.is_primary
+                                    })));
+
+                                const row = new ActionRowBuilder().addComponents(accountSelect);
+
+                                // Store note temporarily
+                                if (note) {
+                                    client.tempData = client.tempData || {};
+                                    client.tempData[`${userId}_${sessionId}_note`] = note;
+                                }
+
+                                await interaction.editReply({
+                                    content: 'Select which accounts to use for this session:',
+                                    components: [row]
+                                });
+                            });
+                    });
+            });
+    });
+}
+
+async function handleManageSession(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+
+    const sessionId = interaction.options.getInteger('session-id');
+    const userId = interaction.user.id;
+
+    // Get session details
+    db.get(`SELECT * FROM sessions WHERE id = ?`, [sessionId], (err, session) => {
+        if (!session) {
+            interaction.editReply('Session not found.');
+            return;
+        }
+
+        if (session.creator_id !== userId) {
+            interaction.editReply('You can only manage sessions you created.');
+            return;
+        }
+
+        // Get queue entries with account details
+        db.all(`SELECT sq.*, u.username, GROUP_CONCAT(ua.id || ':' || ua.account_name || ':' || 
+                COALESCE(ua.tank_rank, '') || ':' || COALESCE(ua.tank_division, '') || ':' ||
+                COALESCE(ua.dps_rank, '') || ':' || COALESCE(ua.dps_division, '') || ':' ||
+                COALESCE(ua.support_rank, '') || ':' || COALESCE(ua.support_division, ''), '|') as accounts_info
+                FROM session_queue sq 
+                LEFT JOIN users u ON sq.user_id = u.discord_id
+                LEFT JOIN user_accounts ua ON ua.discord_id = sq.user_id AND ua.id IN (SELECT value FROM json_each(sq.account_ids))
+                WHERE sq.session_id = ? 
+                GROUP BY sq.id`, [sessionId], async (err, queue) => {
+            
+            if (err) {
+                console.error('Queue query error:', err);
+                await interaction.editReply('Error loading queue.');
+                return;
+            }
+
+            const embed = new EmbedBuilder()
+                .setTitle('Manage Session')
+                .setDescription(`Managing session #${sessionId}`)
+                .setColor(0x0099FF);
+
+            const components = [];
+
+            // Add session control buttons
+            const controlRow = new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`close_session_${sessionId}`)
+                        .setLabel(session.status === 'closed' ? 'Open Session' : 'Close Session')
+                        .setStyle(session.status === 'closed' ? ButtonStyle.Success : ButtonStyle.Danger),
+                    new ButtonBuilder()
+                        .setCustomId(`edit_session_${sessionId}`)
+                        .setLabel('Edit Details')
+                        .setStyle(ButtonStyle.Secondary),
+                    new ButtonBuilder()
+                        .setCustomId(`cancel_session_${sessionId}`)
+                        .setLabel('Cancel Session')
+                        .setStyle(ButtonStyle.Danger)
+                );
+            components.push(controlRow);
+
+            if (queue && queue.length > 0) {
+                embed.addFields({ name: 'Players in Queue', value: `${queue.length} player(s) waiting`, inline: false });
+
+                // Create selection buttons for each queued player
+                for (const player of queue.slice(0, 4)) { // Discord limit: 5 buttons per row
+                    const user = await getUser(client, player.user_id);
+                    const username = user ? user.username : player.username || 'Unknown';
+                    const roles = JSON.parse(player.preferred_roles || '[]');
+                    
+                    const playerRow = new ActionRowBuilder();
+                    
+                    // Parse accounts info
+                    let accountsText = '';
+                    if (player.accounts_info) {
+                        const accounts = player.accounts_info.split('|').map(info => {
+                            const [id, name, tankRank, tankDiv, dpsRank, dpsDiv, supRank, supDiv] = info.split(':');
+                            return { id, name, tankRank, tankDiv, dpsRank, dpsDiv, supRank, supDiv };
+                        });
+                        
+                        accountsText = accounts.map(acc => {
+                            const ranks = [];
+                            if (acc.tankRank && acc.tankDiv) ranks.push(`T:${acc.tankRank}${acc.tankDiv}`);
+                            if (acc.dpsRank && acc.dpsDiv) ranks.push(`D:${acc.dpsRank}${acc.dpsDiv}`);
+                            if (acc.supRank && acc.supDiv) ranks.push(`S:${acc.supRank}${acc.supDiv}`);
+                            return `${acc.name} (${ranks.join(' ')})`;
+                        }).join(', ');
+                    }
+
+                    embed.addFields({
+                        name: `${username}`,
+                        value: `Accounts: ${accountsText || 'No accounts'}\nRoles: ${roles.join(', ')}\n${player.note ? `Note: ${player.note}` : ''}`,
+                        inline: false
+                    });
+
+                    // Add selection buttons for each role they queued for
+                    for (const role of roles.slice(0, 3)) { // Max 3 roles
+                        playerRow.addComponents(
+                            new ButtonBuilder()
+                                .setCustomId(`select_player_${sessionId}_${player.id}_${role}`)
+                                .setLabel(`Select as ${role}`)
+                                .setEmoji(ROLE_EMOJIS[role])
+                                .setStyle(ButtonStyle.Primary)
+                        );
+                    }
+
+                    if (playerRow.components.length > 0) {
+                        components.push(playerRow);
+                    }
+                }
+            } else {
+                embed.addFields({ name: 'Queue Status', value: 'No players in queue', inline: false });
+            }
+
+            await interaction.editReply({
+                embeds: [embed],
+                components: components
+            });
+        });
+    });
+}
+
+async function handleSelectPlayer(interaction, params) {
+    const [sessionId, queueId, role] = params.split('_');
+    
+    await interaction.deferReply({ ephemeral: true });
+
+    // Get queue entry details
+    db.get(`SELECT * FROM session_queue WHERE id = ?`, [queueId], (err, queueEntry) => {
+        if (!queueEntry) {
+            interaction.editReply('Queue entry not found.');
+            return;
+        }
+
+        // Get the accounts for this role
+        const accountIds = JSON.parse(queueEntry.account_ids || '[]');
+        
+        db.all(`SELECT * FROM user_accounts WHERE id IN (${accountIds.map(() => '?').join(',')})`, accountIds, async (err, accounts) => {
+            if (!accounts || accounts.length === 0) {
+                await interaction.editReply('No accounts found.');
+                return;
+            }
+
+            // Filter accounts that have a rank for the selected role
+            const roleColumn = `${role.toLowerCase()}_rank`;
+            const validAccounts = accounts.filter(acc => acc[roleColumn]);
+
+            if (validAccounts.length === 0) {
+                await interaction.editReply(`No accounts found with ${role} rank.`);
+                return;
+            }
+
+            if (validAccounts.length === 1) {
+                // Auto-select if only one valid account
+                await addPlayerToTeam(interaction, sessionId, queueEntry.user_id, validAccounts[0].id, role, queueEntry.is_streaming);
+            } else {
+                // Show account selection
+                const accountSelect = new StringSelectMenuBuilder()
+                    .setCustomId(`select_account_team_${sessionId}_${queueEntry.user_id}_${role}_${queueEntry.is_streaming}`)
+                    .setPlaceholder(`Select account for ${role}`)
+                    .addOptions(validAccounts.map(acc => ({
+                        label: acc.account_name,
+                        value: acc.id.toString(),
+                        description: formatRank(acc[roleColumn], acc[`${role.toLowerCase()}_division`])
+                    })));
+
+                const row = new ActionRowBuilder().addComponents(accountSelect);
+
+                await interaction.editReply({
+                    content: `Select which account to use for ${role}:`,
+                    components: [row]
+                });
+            }
+        });
+    });
+}
+
+async function addPlayerToTeam(interaction, sessionId, userId, accountId, role, isStreaming) {
+    const creatorId = interaction.user.id;
+
+    // Check if role is already filled
+    const mode = await new Promise((resolve) => {
+        db.get(`SELECT game_mode FROM sessions WHERE id = ?`, [sessionId], (err, session) => {
+            resolve(session ? GAME_MODES[session.game_mode] : null);
+        });
+    });
+
+    if (!mode) {
+        await interaction.editReply('Session not found.');
+        return;
+    }
+
+    // Check role availability
+    if (!mode.roles.Any) {
+        const currentCount = await new Promise((resolve) => {
+            db.get(`SELECT COUNT(*) as count FROM session_participants WHERE session_id = ? AND role = ?`,
+                [sessionId, role], (err, result) => {
+                    resolve(result ? result.count : 0);
+                });
+        });
+
+        if (currentCount >= mode.roles[role]) {
+            await interaction.editReply(`The ${role} slots are already full.`);
+            return;
+        }
+    }
+
+    // Add to participants
+    db.run(`INSERT INTO session_participants (session_id, user_id, account_id, role, is_streaming, selected_by) 
+            VALUES (?, ?, ?, ?, ?, ?)`,
+        [sessionId, userId, accountId, role, isStreaming, creatorId], async (err) => {
+            if (err) {
+                await interaction.editReply('Error adding player to team.');
+                return;
+            }
+
+            // Remove from queue
+            db.run(`DELETE FROM session_queue WHERE session_id = ? AND user_id = ?`,
+                [sessionId, userId], async (err) => {
+                    await interaction.editReply(`Player added to team as ${role}!`);
+                    await updateSessionMessage(sessionId);
+                });
+        });
+}
+
+async function handleCloseSession(interaction, sessionId) {
+    await interaction.deferReply({ ephemeral: true });
+
+    const userId = interaction.user.id;
+
+    db.get(`SELECT * FROM sessions WHERE id = ?`, [sessionId], (err, session) => {
+        if (!session) {
+            interaction.editReply('Session not found.');
+            return;
+        }
+
+        if (session.creator_id !== userId) {
+            interaction.editReply('Only the session creator can close/open the session.');
+            return;
+        }
+
+        const newStatus = session.status === 'closed' ? 'open' : 'closed';
+
+        db.run(`UPDATE sessions SET status = ? WHERE id = ?`, [newStatus, sessionId], async (err) => {
+            if (err) {
+                await interaction.editReply('Error updating session status.');
+                return;
+            }
+
+            await interaction.editReply(`Session ${newStatus === 'closed' ? 'closed' : 'opened'} successfully!`);
+            await updateSessionMessage(sessionId);
+        });
+    });
+}
+
+async function handleEditSession(interaction, sessionId) {
+    await interaction.deferReply({ ephemeral: true });
+
+    const userId = interaction.user.id;
+
+    db.get(`SELECT * FROM sessions WHERE id = ?`, [sessionId], (err, session) => {
+        if (!session) {
+            interaction.editReply('Session not found.');
+            return;
+        }
+
+        if (session.creator_id !== userId) {
+            interaction.editReply('Only the session creator can edit the session.');
+            return;
+        }
+
+        // Create day selection menu
+        const daySelect = new StringSelectMenuBuilder()
+            .setCustomId(`edit_day_${sessionId}`)
+            .setPlaceholder('Change day (optional)')
+            .addOptions([
+                { label: 'Keep current', value: 'keep' },
+                { label: 'Today', value: 'today' },
+                { label: 'Tomorrow', value: 'tomorrow' },
+                { label: 'Monday', value: 'monday' },
+                { label: 'Tuesday', value: 'tuesday' },
+                { label: 'Wednesday', value: 'wednesday' },
+                { label: 'Thursday', value: 'thursday' },
+                { label: 'Friday', value: 'friday' },
+                { label: 'Saturday', value: 'saturday' },
+                { label: 'Sunday', value: 'sunday' }
+            ]);
+
+        const row = new ActionRowBuilder().addComponents(daySelect);
+
+        const currentTime = new Date(session.scheduled_time);
+        const embed = new EmbedBuilder()
+            .setTitle('Edit Session')
+            .setDescription('Select what you want to change:')
+            .addFields(
+                { name: 'Current Time', value: `<t:${Math.floor(currentTime.getTime() / 1000)}:F>`, inline: true },
+                { name: 'Current Description', value: session.description || 'No description', inline: true }
+            )
+            .setColor(0x0099FF);
+
+        await interaction.editReply({
+            embeds: [embed],
+            components: [row],
+            content: 'To change the description, use `/create-session` again with the same time.'
+        });
+    });
+}
+
+async function handleJoinQueueButton(interaction, sessionId) {
+    await interaction.deferReply({ ephemeral: true });
+
+    const userId = interaction.user.id;
+
+    // Check if already in queue or team
+    db.get(`SELECT * FROM session_queue WHERE session_id = ? AND user_id = ?`,
+        [sessionId, userId], (err, inQueue) => {
+            if (inQueue) {
+                interaction.editReply('You are already in the queue for this session!');
+                return;
+            }
+
+            db.get(`SELECT * FROM session_participants WHERE session_id = ? AND user_id = ?`,
+                [sessionId, userId], (err, inTeam) => {
+                    if (inTeam) {
+                        interaction.editReply('You are already in the team for this session!');
+                        return;
+                    }
+
+                    // Get user's accounts
+                    db.all(`SELECT * FROM user_accounts WHERE discord_id = ? ORDER BY is_primary DESC`,
+                        [userId], async (err, accounts) => {
+                            if (!accounts || accounts.length === 0) {
+                                await interaction.editReply('You need to add an account first!');
+                                return;
+                            }
+
+                            // Create account selection menu
+                            const accountSelect = new StringSelectMenuBuilder()
+                                .setCustomId(`select_accounts_join_${sessionId}`)
+                                .setPlaceholder('Select which accounts to use')
+                                .setMinValues(1)
+                                .setMaxValues(Math.min(accounts.length, 3))
+                                .addOptions(accounts.map(acc => ({
+                                    label: acc.account_name,
+                                    value: acc.id.toString(),
+                                    description: `Tank: ${formatRank(acc.tank_rank, acc.tank_division)} | DPS: ${formatRank(acc.dps_rank, acc.dps_division)} | Support: ${formatRank(acc.support_rank, acc.support_division)}`,
+                                    default: acc.is_primary
+                                })));
+
+                            const row = new ActionRowBuilder().addComponents(accountSelect);
+
+                            await interaction.editReply({
+                                content: 'Select which accounts to use for this session:',
+                                components: [row]
+                            });
+                        });
+                });
+        });
+}
+
+async function handleLeaveQueueButton(interaction, sessionId) {
+    await interaction.deferReply({ ephemeral: true });
+
+    const userId = interaction.user.id;
+
+    db.run(`DELETE FROM session_queue WHERE session_id = ? AND user_id = ?`,
+        [sessionId, userId], async function(err) {
+            if (err) {
+                await interaction.editReply('Error leaving queue.');
+                return;
+            }
+
+            if (this.changes === 0) {
+                await interaction.editReply('You were not in the queue for this session.');
+                return;
+            }
+
+            await interaction.editReply('You have left the queue.');
+            await updateSessionMessage(sessionId);
+        });
+}
+
+async function handleRefreshSession(interaction, sessionId) {
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+        await updateSessionMessage(sessionId);
+        await interaction.editReply('Session refreshed successfully!');
+    } catch (error) {
+        await interaction.editReply('Error refreshing session.');
+    }
+}
+
+async function handleManageTeamButton(interaction, sessionId) {
+    // Reuse the manage session handler
+    interaction.options = {
+        getInteger: () => parseInt(sessionId)
+    };
+    await handleManageSession(interaction);
+}
+
 async function handleCreateSession(interaction) {
     await interaction.deferReply({ ephemeral: true });
 
@@ -661,10 +1197,11 @@ async function handleCreateSession(interaction) {
 async function handleViewSessions(interaction) {
     await interaction.deferReply();
 
-    db.all(`SELECT s.*, COUNT(sq.id) as queue_count 
+    db.all(`SELECT s.*, COUNT(DISTINCT sq.id) as queue_count, COUNT(DISTINCT sp.id) as participant_count
             FROM sessions s 
             LEFT JOIN session_queue sq ON s.id = sq.session_id 
-            WHERE s.status = 'open' AND s.guild_id = ? 
+            LEFT JOIN session_participants sp ON s.id = sp.session_id
+            WHERE s.status != 'cancelled' AND s.guild_id = ? 
             GROUP BY s.id 
             ORDER BY s.scheduled_time ASC 
             LIMIT 10`, [interaction.guild.id], async (err, sessions) => {
@@ -676,9 +1213,12 @@ async function handleViewSessions(interaction) {
 
         const embeds = [];
         for (const session of sessions) {
-            // Get participants for this session
+            // Get participants for display
             const participants = await new Promise((resolve) => {
-                db.all(`SELECT * FROM session_participants WHERE session_id = ?`, [session.id], (err, rows) => {
+                db.all(`SELECT sp.*, ua.account_name, ua.tank_rank, ua.tank_division, ua.dps_rank, ua.dps_division, ua.support_rank, ua.support_division 
+                        FROM session_participants sp 
+                        LEFT JOIN user_accounts ua ON sp.account_id = ua.id 
+                        WHERE sp.session_id = ?`, [session.id], (err, rows) => {
                     resolve(rows || []);
                 });
             });
@@ -739,6 +1279,73 @@ async function handleMyProfile(interaction) {
     });
 }
 
+async function handleCancelSession(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+
+    const sessionId = interaction.options.getInteger('session-id');
+    const userId = interaction.user.id;
+
+    db.get(`SELECT * FROM sessions WHERE id = ?`, [sessionId], (err, session) => {
+        if (!session) {
+            interaction.editReply('Session not found.');
+            return;
+        }
+
+        if (session.creator_id !== userId) {
+            interaction.editReply('Only the session creator can cancel the session.');
+            return;
+        }
+
+        db.run(`UPDATE sessions SET status = 'cancelled' WHERE id = ?`, [sessionId], async (err) => {
+            if (err) {
+                await interaction.editReply('Error cancelling session.');
+                return;
+            }
+
+            // Update the session message
+            try {
+                const channel = await client.channels.fetch(session.channel_id);
+                const message = await channel.messages.fetch(session.message_id);
+                
+                const embed = new EmbedBuilder()
+                    .setTitle('Session Cancelled')
+                    .setDescription(`This session has been cancelled by the creator.`)
+                    .setColor(0xFF0000)
+                    .setFooter({ text: `Session ID: ${sessionId}` });
+
+                await message.edit({ embeds: [embed], components: [] });
+            } catch (error) {
+                console.error('Error updating cancelled session message:', error);
+            }
+
+            await interaction.editReply('Session cancelled successfully.');
+        });
+    });
+}
+
+async function handleLeaveQueue(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+
+    const sessionId = interaction.options.getInteger('session-id');
+    const userId = interaction.user.id;
+
+    db.run(`DELETE FROM session_queue WHERE session_id = ? AND user_id = ?`,
+        [sessionId, userId], async function(err) {
+            if (err) {
+                await interaction.editReply('Error leaving queue.');
+                return;
+            }
+
+            if (this.changes === 0) {
+                await interaction.editReply('You were not in the queue for this session.');
+                return;
+            }
+
+            await interaction.editReply('You have left the queue.');
+            await updateSessionMessage(sessionId);
+        });
+}
+
 // Dropdown menu handlers
 client.on('interactionCreate', async interaction => {
     if (!interaction.isStringSelectMenu()) return;
@@ -770,12 +1377,178 @@ client.on('interactionCreate', async interaction => {
             await handleRankSelection(interaction);
         } else if (customId.startsWith('select_division_')) {
             await handleDivisionSelection(interaction);
+        } else if (customId.startsWith('select_accounts_join_')) {
+            await handleAccountsJoinSelection(interaction);
+        } else if (customId.startsWith('select_roles_join_')) {
+            await handleRolesJoinSelection(interaction);
+        } else if (customId.startsWith('select_account_quick_')) {
+            await handleAccountQuickSelection(interaction);
+        } else if (customId.startsWith('select_account_team_')) {
+            await handleAccountTeamSelection(interaction);
+        } else if (customId.startsWith('edit_day_')) {
+            await handleEditDaySelection(interaction);
         }
     } catch (error) {
         console.error('Select menu error:', error);
         await interaction.reply({ content: 'An error occurred.', ephemeral: true });
     }
 });
+
+async function handleAccountsJoinSelection(interaction) {
+    const sessionId = interaction.customId.split('_')[3];
+    const selectedAccountIds = interaction.values;
+    const userId = interaction.user.id;
+
+    // Get session mode
+    db.get(`SELECT game_mode FROM sessions WHERE id = ?`, [sessionId], (err, session) => {
+        if (!session) {
+            interaction.reply({ content: 'Session not found.', ephemeral: true });
+            return;
+        }
+
+        const mode = GAME_MODES[session.game_mode];
+
+        // Get user's preferred roles
+        db.get(`SELECT preferred_roles FROM users WHERE discord_id = ?`, [userId], async (err, user) => {
+            const preferredRoles = user?.preferred_roles ? JSON.parse(user.preferred_roles) : [];
+
+            // Create role selection menu
+            const roleOptions = mode.roles.Any ? 
+                [{ label: 'Any Role', value: 'Any', emoji: '🎮' }] :
+                Object.keys(mode.roles).map(role => ({
+                    label: role,
+                    value: role,
+                    emoji: ROLE_EMOJIS[role],
+                    default: preferredRoles.includes(role)
+                }));
+
+            const roleSelect = new StringSelectMenuBuilder()
+                .setCustomId(`select_roles_join_${sessionId}_${selectedAccountIds.join(',')}`)
+                .setPlaceholder('Select roles you can play')
+                .setMinValues(1)
+                .setMaxValues(roleOptions.length)
+                .addOptions(roleOptions);
+
+            const row = new ActionRowBuilder().addComponents(roleSelect);
+
+            await interaction.update({
+                content: 'Select which roles you can play for this session:',
+                components: [row]
+            });
+        });
+    });
+}
+
+async function handleRolesJoinSelection(interaction) {
+    const parts = interaction.customId.split('_');
+    const sessionId = parts[3];
+    const accountIds = parts[4].split(',');
+    const selectedRoles = interaction.values;
+    const userId = interaction.user.id;
+
+    // Get note if stored
+    const note = client.tempData?.[`${userId}_${sessionId}_note`] || null;
+    if (client.tempData?.[`${userId}_${sessionId}_note`]) {
+        delete client.tempData[`${userId}_${sessionId}_note`];
+    }
+
+    // Add to queue
+    db.run(`INSERT INTO session_queue (session_id, user_id, account_ids, preferred_roles, note) 
+            VALUES (?, ?, ?, ?, ?)`,
+        [sessionId, userId, JSON.stringify(accountIds), JSON.stringify(selectedRoles), note], async (err) => {
+            if (err) {
+                await interaction.update({ content: 'Error joining queue.', components: [] });
+                return;
+            }
+
+            await interaction.update({
+                content: `Successfully joined the queue! Selected roles: ${selectedRoles.join(', ')}${note ? `\nNote: ${note}` : ''}`,
+                components: []
+            });
+            await updateSessionMessage(sessionId);
+        });
+}
+
+async function handleAccountQuickSelection(interaction) {
+    const parts = interaction.customId.split('_');
+    const sessionId = parts[3];
+    const role = parts[4];
+    const accountId = interaction.values[0];
+
+    await processQuickJoin(interaction, sessionId, role, accountId);
+}
+
+async function handleAccountTeamSelection(interaction) {
+    const parts = interaction.customId.split('_');
+    const sessionId = parts[3];
+    const userId = parts[4];
+    const role = parts[5];
+    const isStreaming = parts[6] === 'true';
+    const accountId = interaction.values[0];
+
+    await addPlayerToTeam(interaction, sessionId, userId, accountId, role, isStreaming);
+}
+
+async function handleEditDaySelection(interaction) {
+    const sessionId = interaction.customId.split('_')[2];
+    const selectedDay = interaction.values[0];
+
+    if (selectedDay === 'keep') {
+        await interaction.update({
+            content: 'Session time unchanged.',
+            components: [],
+            embeds: []
+        });
+        return;
+    }
+
+    // Calculate new date
+    const now = new Date();
+    let targetDate = new Date();
+
+    if (selectedDay === 'today') {
+        // Keep today's date
+    } else if (selectedDay === 'tomorrow') {
+        targetDate.setDate(targetDate.getDate() + 1);
+    } else {
+        // Find next occurrence of the selected day
+        const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+        const targetDayIndex = days.indexOf(selectedDay);
+        const currentDayIndex = now.getDay();
+        
+        let daysToAdd = targetDayIndex - currentDayIndex;
+        if (daysToAdd <= 0) daysToAdd += 7;
+        
+        targetDate.setDate(targetDate.getDate() + daysToAdd);
+    }
+
+    // Get current session time
+    db.get(`SELECT scheduled_time FROM sessions WHERE id = ?`, [sessionId], (err, session) => {
+        if (!session) {
+            interaction.update({ content: 'Session not found.', components: [] });
+            return;
+        }
+
+        const currentTime = new Date(session.scheduled_time);
+        targetDate.setHours(currentTime.getHours(), currentTime.getMinutes(), 0, 0);
+
+        // Update session
+        db.run(`UPDATE sessions SET scheduled_time = ? WHERE id = ?`,
+            [targetDate.toISOString(), sessionId], async (err) => {
+                if (err) {
+                    await interaction.update({ content: 'Error updating session.', components: [] });
+                    return;
+                }
+
+                await interaction.update({
+                    content: `Session date updated to ${selectedDay}!`,
+                    components: [],
+                    embeds: []
+                });
+                await updateSessionMessage(sessionId);
+            });
+    });
+}
 
 async function handleDaySelection(interaction) {
     const [, , gameMode, maxRankDiff] = interaction.customId.split('_');
@@ -914,44 +1687,6 @@ async function handleQuickJoin(interaction, sessionId, role) {
 
     const userId = interaction.user.id;
 
-    // Get user's accounts that have a rank for this role
-    const rankColumn = `${role.toLowerCase()}_rank`;
-    const divisionColumn = `${role.toLowerCase()}_division`;
-
-    db.all(`SELECT * FROM user_accounts WHERE discord_id = ? AND ${rankColumn} IS NOT NULL ORDER BY is_primary DESC`,
-        [userId], async (err, accounts) => {
-            if (!accounts || accounts.length === 0) {
-                await interaction.editReply('You need to add an account and set ranks first!');
-                return;
-            }
-
-            if (accounts.length === 1) {
-                // Auto-select if only one account
-                await processQuickJoin(interaction, sessionId, role, accounts[0].id);
-            } else {
-                // Show account selection
-                const accountSelect = new StringSelectMenuBuilder()
-                    .setCustomId(`select_account_quick_${sessionId}_${role}`)
-                    .setPlaceholder('Select account')
-                    .addOptions(accounts.map(acc => ({
-                        label: `${acc.account_name} - ${formatRank(acc[rankColumn], acc[divisionColumn])}`,
-                        value: acc.id.toString(),
-                        default: acc.is_primary
-                    })));
-
-                const row = new ActionRowBuilder().addComponents(accountSelect);
-
-                await interaction.editReply({
-                    content: `Select which account to use for ${role}:`,
-                    components: [row]
-                });
-            }
-        });
-}
-
-async function processQuickJoin(interaction, sessionId, role, accountId) {
-    const userId = interaction.user.id;
-
     // Check if already in queue or team
     db.get(`SELECT * FROM session_queue WHERE session_id = ? AND user_id = ?`,
         [sessionId, userId], (err, inQueue) => {
@@ -967,19 +1702,57 @@ async function processQuickJoin(interaction, sessionId, role, accountId) {
                         return;
                     }
 
-                    // Add to queue
-                    db.run(`INSERT INTO session_queue (session_id, user_id, account_id, preferred_roles) 
-                            VALUES (?, ?, ?, ?)`,
-                        [sessionId, userId, accountId, JSON.stringify([role])], async (err) => {
-                            if (err) {
-                                await interaction.editReply('Error joining queue.');
+                    // Get user's accounts that have a rank for this role
+                    const rankColumn = `${role.toLowerCase()}_rank`;
+                    const divisionColumn = `${role.toLowerCase()}_division`;
+
+                    db.all(`SELECT * FROM user_accounts WHERE discord_id = ? AND ${rankColumn} IS NOT NULL ORDER BY is_primary DESC`,
+                        [userId], async (err, accounts) => {
+                            if (!accounts || accounts.length === 0) {
+                                await interaction.editReply('You need to add an account and set ranks first!');
                                 return;
                             }
 
-                            await interaction.editReply(`Successfully joined the queue as ${role}!`);
-                            await updateSessionMessage(sessionId);
+                            if (accounts.length === 1) {
+                                // Auto-select if only one account
+                                await processQuickJoin(interaction, sessionId, role, accounts[0].id);
+                            } else {
+                                // Show account selection
+                                const accountSelect = new StringSelectMenuBuilder()
+                                    .setCustomId(`select_account_quick_${sessionId}_${role}`)
+                                    .setPlaceholder('Select account')
+                                    .addOptions(accounts.map(acc => ({
+                                        label: `${acc.account_name} - ${formatRank(acc[rankColumn], acc[divisionColumn])}`,
+                                        value: acc.id.toString(),
+                                        default: acc.is_primary
+                                    })));
+
+                                const row = new ActionRowBuilder().addComponents(accountSelect);
+
+                                await interaction.editReply({
+                                    content: `Select which account to use for ${role}:`,
+                                    components: [row]
+                                });
+                            }
                         });
                 });
+        });
+}
+
+async function processQuickJoin(interaction, sessionId, role, accountId) {
+    const userId = interaction.user.id;
+
+    // Add to queue with single account and role
+    db.run(`INSERT INTO session_queue (session_id, user_id, account_ids, preferred_roles) 
+            VALUES (?, ?, ?, ?)`,
+        [sessionId, userId, JSON.stringify([accountId]), JSON.stringify([role])], async (err) => {
+            if (err) {
+                await interaction.editReply('Error joining queue.');
+                return;
+            }
+
+            await interaction.editReply(`Successfully joined the queue as ${role}!`);
+            await updateSessionMessage(sessionId);
         });
 }
 
@@ -1023,34 +1796,57 @@ async function handleToggleStreaming(interaction, sessionId) {
         });
 }
 
-async function handleRefreshSession(interaction, sessionId) {
+async function handleEditAccount(interaction) {
     await interaction.deferReply({ ephemeral: true });
 
-    db.get(`SELECT * FROM sessions WHERE id = ?`, [sessionId], async (err, session) => {
-        if (!session) {
-            await interaction.editReply('Session not found.');
-            return;
-        }
+    const userId = interaction.user.id;
+    const accountName = interaction.options.getString('account-name');
 
-        // Get queue and participants
-        const queueCount = await new Promise((resolve) => {
-            db.get(`SELECT COUNT(*) as count FROM session_queue WHERE session_id = ?`, [sessionId], (err, result) => {
-                resolve(result ? result.count : 0);
+    // Get the account
+    db.get(`SELECT * FROM user_accounts WHERE discord_id = ? AND account_name = ?`,
+        [userId, accountName], async (err, account) => {
+            if (!account) {
+                await interaction.editReply('Account not found.');
+                return;
+            }
+
+            const embed = new EmbedBuilder()
+                .setTitle(`Edit Account: ${accountName}`)
+                .setColor(0x0099FF)
+                .addFields(
+                    { name: '🛡️ Tank', value: formatRank(account.tank_rank, account.tank_division), inline: true },
+                    { name: '⚔️ DPS', value: formatRank(account.dps_rank, account.dps_division), inline: true },
+                    { name: '💚 Support', value: formatRank(account.support_rank, account.support_division), inline: true }
+                );
+
+            const row = new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`set_rank_${account.id}_Tank`)
+                        .setLabel('Edit Tank')
+                        .setEmoji('🛡️')
+                        .setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder()
+                        .setCustomId(`set_rank_${account.id}_DPS`)
+                        .setLabel('Edit DPS')
+                        .setEmoji('⚔️')
+                        .setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder()
+                        .setCustomId(`set_rank_${account.id}_Support`)
+                        .setLabel('Edit Support')
+                        .setEmoji('💚')
+                        .setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder()
+                        .setCustomId(`delete_account_${account.id}`)
+                        .setLabel('Delete Account')
+                        .setStyle(ButtonStyle.Danger)
+                );
+
+            await interaction.editReply({
+                embeds: [embed],
+                components: [row]
             });
         });
-
-        const participants = await new Promise((resolve) => {
-            db.all(`SELECT sp.*, ua.account_name, ua.tank_rank, ua.tank_division, ua.dps_rank, ua.dps_division, ua.support_rank, ua.support_division 
-                    FROM session_participants sp 
-                    LEFT JOIN user_accounts ua ON sp.account_id = ua.id 
-                    WHERE sp.session_id = ?`, [sessionId], (err, rows) => {
-                resolve(rows || []);
-            });
-        });
-
-        const embed = await createSessionEmbed(session, queueCount, participants);
-        await interaction.editReply({ embeds: [embed] });
-    });
 }
 
 // Additional button handlers for rank setting
@@ -1079,6 +1875,21 @@ client.on('interactionCreate', async interaction => {
             content: `Select your ${role} rank:`,
             components: [row],
             ephemeral: true
+        });
+    } else if (customId.startsWith('delete_account_')) {
+        const accountId = customId.split('_')[2];
+        
+        db.run(`DELETE FROM user_accounts WHERE id = ?`, [accountId], async (err) => {
+            if (err) {
+                await interaction.reply({ content: 'Error deleting account.', ephemeral: true });
+                return;
+            }
+
+            await interaction.update({
+                content: 'Account deleted successfully!',
+                embeds: [],
+                components: []
+            });
         });
     }
 });
@@ -1136,4 +1947,13 @@ client.once('ready', () => {
 });
 
 // Login
-client.login(process.env.BOT_TOKEN);
+if (!process.env.BOT_TOKEN) {
+    console.error('ERROR: BOT_TOKEN not found in environment variables!');
+    console.error('Please create a .env file with: BOT_TOKEN=your_token_here');
+    process.exit(1);
+}
+
+client.login(process.env.BOT_TOKEN).catch(error => {
+    console.error('Failed to login:', error);
+    process.exit(1);
+});
